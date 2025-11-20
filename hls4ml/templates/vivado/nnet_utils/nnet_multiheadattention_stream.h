@@ -106,10 +106,75 @@ typename CONFIG_T::inv_table_t lookup_inv(
     return inv_table[index];
 }
 
+template<class CONFIG_T>
+typename std::enable_if<!CONFIG_T::enable_topk>::type
+staged_topk(typename CONFIG_T::accum_t* input, hls::stream<int>& output) {
+    // Do nothing
+}
+
+template<typename CONFIG_T>
+void staged_topk(
+    typename CONFIG_T::accum_t avg_cls_attention[],
+    hls::stream<int> &topk_idx,
+    typename std::enable_if<CONFIG_T::enable_topk>::type* = nullptr) {
+    
+    #pragma HLS INLINE off
+    
+    // 使用較大的 URAM 或 BRAM 來儲存所有元素和索引
+    struct pair_t {
+        typename CONFIG_T::accum_t value;
+        int index;
+    };
+    pair_t candidates[CONFIG_T::seq_len-1];
+    #pragma HLS RESOURCE variable=candidates core=RAM_1P_BRAM
+    
+    // 第一階段：單純地儲存所有元素及其索引
+    store_stage:
+    for (int i = 0; i < CONFIG_T::seq_len-1; i++) {
+        #pragma HLS PIPELINE II=1
+        candidates[i].value = avg_cls_attention[i];
+        candidates[i].index = i;
+    }
+    
+    // 第二階段：基本的冒泡排序，僅對前K個元素進行部分排序
+    partial_sort_stage:
+    for (int k = 0; k < CONFIG_T::topk; k++) {
+        #pragma HLS PIPELINE off // 關閉此層級的流水線
+        
+        int best_idx = k;
+        typename CONFIG_T::accum_t best_val = candidates[k].value;
+        
+        // 找出剩餘元素中的最大值
+        find_best:
+        for (int i = k+1; i < CONFIG_T::seq_len-1; i++) {
+            #pragma HLS PIPELINE II=3 // 較寬鬆的流水線約束
+            if (candidates[i].value > best_val) {
+                best_val = candidates[i].value;
+                best_idx = i;
+            }
+        }
+        
+        // 交換到前k個位置
+        if (best_idx != k) {
+            pair_t temp = candidates[k];
+            candidates[k] = candidates[best_idx];
+            candidates[best_idx] = temp;
+        }
+    }
+    
+    // 第三階段：輸出前K個元素
+    output_stage:
+    for (int k = 0; k < CONFIG_T::topk; k++) {
+        #pragma HLS PIPELINE II=1
+        topk_idx.write(candidates[k].index + 1); // +1 跳過 CLS token
+    }
+}
+
 template<class data_T, class res_T, typename CONFIG_T>
 void MultiHeadAttention(
     hls::stream<data_T>    &data_qkv,
     hls::stream<res_T>     &res,
+    hls::stream<int>       &topk_idx,  // 只在特定層會用
     typename CONFIG_T::in_proj_weight_t     in_proj_weight[3*CONFIG_T::n_head*CONFIG_T::embed_dim*CONFIG_T::head_dim], // embed_dim, 3, n_head, head_dim
     typename CONFIG_T::in_proj_bias_t       in_proj_bias[3*CONFIG_T::n_head*CONFIG_T::head_dim],
     typename CONFIG_T::out_proj_weight_t    out_proj_weight[CONFIG_T::n_head*CONFIG_T::head_dim*CONFIG_T::embed_dim],  // n_head, head_dim, embeb_dim
@@ -135,6 +200,9 @@ void MultiHeadAttention(
     #pragma HLS ARRAY_RESHAPE variable=K cyclic factor=CONFIG_T::n_head*tf_H*tf_T dim=1
     #pragma HLS ARRAY_RESHAPE variable=V cyclic factor=CONFIG_T::n_head*tf_H*tf_T dim=1
     #pragma HLS ARRAY_RESHAPE variable=Q cyclic factor=CONFIG_T::n_head*tf_H*tf_T dim=1
+    #pragma HLS BIND_STORAGE variable=K type=ram_s2p impl=uram
+    #pragma HLS BIND_STORAGE variable=V type=ram_s2p impl=uram
+    #pragma HLS BIND_STORAGE variable=Q type=ram_s2p impl=uram
     #pragma HLS ARRAY_RESHAPE variable=O cyclic factor=CONFIG_T::n_head*tf_H*tf_T dim=1
     #pragma HLS ARRAY_RESHAPE variable=row_buffer cyclic factor=tf_N*tf_T dim=1
 
@@ -249,6 +317,13 @@ void MultiHeadAttention(
     #pragma HLS ARRAY_PARTITION variable=prev_rowsum    complete dim=0
     #pragma HLS ARRAY_PARTITION variable=rowmax         complete dim=0
     #pragma HLS ARRAY_PARTITION variable=QK             complete dim=0
+    // 在 MultiHeadAttention 函數開頭宣告一個全局數組，只存平均分數
+    typename CONFIG_T::accum_t avg_cls_attention[CONFIG_T::seq_len-1];
+    for (int j = 0; j < CONFIG_T::seq_len-1; j++) {
+        #pragma HLS UNROLL
+        avg_cls_attention[j] = 0;
+    }
+    // #pragma HLS RESOURCE variable=avg_cls_attention core=RAM_2P_BRAM
     int q_idx = 0;
     int k_idx = 0;
     int v_idx = 0;
@@ -271,14 +346,44 @@ void MultiHeadAttention(
                         for (int ii = 0; ii < tf_T; ii++) {
                             for (int jj = 0; jj < tf_T; jj++) {
                                 for (int kk = 0; kk < tf_H; kk++) {
+                                    // int global_j_idx = j * tf_T + jj;
                                     if (hd == 0 && kk == 0){
                                         QK[h*tf_T*tf_T + ii*tf_T + jj] = 0;
                                     }
                                     QK[h*tf_T*tf_T + ii*tf_T + jj] += Q[q_offset + h*tf_H*tf_T + ii*tf_H + kk] * K[k_offset + h*tf_H*tf_T + jj*tf_H + kk] * dk;
+                                    // // 處理 CLS token 的注意力分數 (整合到內層迴圈)
+                                    // if (CONFIG_T::enable_topk && i == 0 && ii == 0 && hd == H-1 && kk == tf_H-1) {
+                                    //     // 跳過 CLS token 自己
+                                    //     if (global_j_idx > 0) {
+                                    //         avg_cls_attention[global_j_idx-1] += QK[h*tf_T*tf_T + jj] / CONFIG_T::n_head;
+                                    //     }
+                                    // }
                                 }
+                                // // 處理 CLS token 的注意力分數 (整合到內層迴圈)
+                                // if (i == 0 && CONFIG_T::enable_topk && hd == H-1 && ii == 0) {
+                                //     int global_j_idx = j * tf_T + jj;
+                                //     // 跳過 CLS token 自己
+                                //     if (global_j_idx > 0) {
+                                //         avg_cls_attention[global_j_idx-1] += QK[h*tf_T*tf_T + jj] / CONFIG_T::n_head;
+                                //     }
+                                // }
                             }
                         }
                     }
+                // int global_j_idx = j * tf_T + jj;
+                // 處理 CLS token (i=0) 的注意力分數
+                if (CONFIG_T::enable_topk && i == 0 && hd == H-1) {
+                    COMPUTE_ATTN_SCORE:
+                        for (int h = 0; h < CONFIG_T::n_head; h++) {
+                            for (int jj = 0; jj < tf_T; jj++) {
+                                // 跳過 CLS token 自己 (global_j_idx = 0)
+                                if (j * tf_T + jj > 0) {
+                                    avg_cls_attention[j * tf_T + jj-1] += QK[h*tf_T*tf_T + jj] / CONFIG_T::n_head;
+                                    // std::cout << "avg_cls_attention[" << global_j_idx-1 << "]: " << avg_cls_attention[global_j_idx-1] << std::endl;
+                                }
+                            }
+                        }
+                }
                 if (j == 0 && hd == 0){
                     INIT_MAX:
                         for (int h = 0; h < CONFIG_T::n_head; h++) {
@@ -357,6 +462,10 @@ void MultiHeadAttention(
         }
     }
 
+    if (CONFIG_T::enable_topk) {
+        staged_topk<CONFIG_T>(avg_cls_attention, topk_idx);
+    }
+
     typename CONFIG_T::out_proj_in_t O_ff[CONFIG_T::n_head * tf_T * tf_H];
     #pragma HLS ARRAY_PARTITION variable=O_ff   complete dim=0
     typename CONFIG_T::out_proj_in_t O_ram[CONFIG_T::n_head * tf_T * CONFIG_T::head_dim];
@@ -369,7 +478,6 @@ void MultiHeadAttention(
     using O_buf = typename CONFIG_T::out_proj_in_t[CONFIG_T::n_head * tf_T * CONFIG_T::head_dim];
     hls::stream_of_blocks<O_buf, 4> O_sob;
     #pragma HLS ARRAY_RESHAPE variable=O_sob    cyclic factor=CONFIG_T::n_head*tf_T*tf_H dim=1
-
     PVO_PRODUCT:
     for (int i = 0; i < T; i++) {
         hls::write_lock<O_buf> O_write_block(O_sob);
@@ -474,7 +582,8 @@ void MultiHeadAttention(
             }
         }
     }
-    
+
+    // 🔹 Step 5: `compute_output:` 讀取 STREAM，與 Top-K 並行
     typename CONFIG_T::accum_t tile_buffer[tf_T*tf_N];
     res_T res_pack;
     int out_proj_weight_offset = 0;

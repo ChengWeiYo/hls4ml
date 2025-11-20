@@ -204,9 +204,9 @@ void LayerNormalize(
                                 xmean[jj] = xsum[jj]*embed_dim_inv;
                                 typename CONFIG_T::accum_t tmp3 = xsqrsum[jj]-xmean[jj]*xmean[jj];
                                 if (CONFIG_T::table_range > CONFIG_T::table_size) {
-                                    index = (tmp3*CONFIG_T::table_size)/CONFIG_T::table_range;
+                                    index = (tmp3*(ap_fixed<32,16>)(CONFIG_T::table_size))/(ap_fixed<32,16>)(CONFIG_T::table_range);
                                 } else {
-                                    index = tmp3*(CONFIG_T::table_size / CONFIG_T::table_range);
+                                    index = tmp3*((ap_fixed<32,16>)(CONFIG_T::table_size) / (ap_fixed<32,16>)(CONFIG_T::table_range));
                                 }
                                 if (index < 0)   index = 0;
                                 if (index > CONFIG_T::table_size-1) index = CONFIG_T::table_size-1;

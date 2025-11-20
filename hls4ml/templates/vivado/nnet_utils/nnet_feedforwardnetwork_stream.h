@@ -142,15 +142,15 @@ void FeedForwardNetwork(
                         }
                     }
                     // 儲存linear_tmp至linear.txt
-                    std::ofstream outfile;
-                    outfile.open("linear.txt", std::ios_base::app);
-                    for(int tt=0; tt<tf_T; tt++){
-                        for(int hh=0; hh<tf_H; hh++){
-                            outfile << linear_tmp[tt*tf_H+hh] << " ";
-                        }
-                        outfile << "\n";
-                    }
-                    outfile.close();
+                    // std::ofstream outfile;
+                    // outfile.open("linear.txt", std::ios_base::app);
+                    // for(int tt=0; tt<tf_T; tt++){
+                    //     for(int hh=0; hh<tf_H; hh++){
+                    //         outfile << linear_tmp[tt*tf_H+hh] << " ";
+                    //     }
+                    //     outfile << "\n";
+                    // }
+                    // outfile.close();
                 }
             }
         }

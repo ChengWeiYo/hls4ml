@@ -244,6 +244,7 @@ class VivadoWriter(Writer):
                             if def_cpp is not None:
                                 newline += '    ' + def_cpp + ';\n'
                                 if var.pragma:
+                                    newline += f'    #pragma HLS BIND_STORAGE variable={var.name} type=FIFO impl=lutram\n'
                                     newline += '    ' + self._make_array_pragma(var) + '\n'
                     func = layer.get_attr('function_cpp', None)
                     if func:
@@ -350,6 +351,8 @@ class VivadoWriter(Writer):
                             all_precision[type_name] = type_var
                 for used_type in all_precision.values():
                     newline += used_type.definition_cpp()
+                inp_typename = model.get_input_variables()[0].type.name  # e.g. "input_t"
+                newline += f"typedef nnet::array<{inp_typename}::value_type, {inp_typename}::size> token_t;\n"
 
             else:
                 newline = line
@@ -652,6 +655,11 @@ class VivadoWriter(Writer):
         # vivado_synth.tcl
         srcpath = os.path.join(filedir, '../templates/vivado/vivado_synth.tcl')
         dstpath = f'{model.config.get_output_dir()}/vivado_synth.tcl'
+        copyfile(srcpath, dstpath)
+
+        # constraints.xdc
+        srcpath = os.path.join(filedir, '../templates/vivado/constraints.xdc')
+        dstpath = f'{model.config.get_output_dir()}/constraints.xdc'
         copyfile(srcpath, dstpath)
 
         # build_lib.sh

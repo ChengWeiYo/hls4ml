@@ -29,6 +29,11 @@ from hls4ml.model.layers import (
     MultiheadAttention,
     LayerNorm,
     FeedForwardNetwork,
+    TopKPruning,
+    EViTPruning,
+    CLC_CachePush,
+    CLC_RecoverAndEmpty3,
+    CLC_RecoverAndEmpty1,
 )
 from hls4ml.model.optimizer import get_backend_passes, layer_optimizer
 from hls4ml.model.types import FixedPrecisionType, IntegerPrecisionType, NamedType, PackedType
@@ -41,6 +46,14 @@ class VivadoBackend(FPGABackend):
         super().__init__('Vivado')
         self._register_layer_attributes()
         self._register_flows()
+
+        try:
+            from hls4ml.backends.vivado.passes import transformer_template as _tt
+            if hasattr(_tt, 'register_templates'):
+                _tt.register_templates(self)  # 傳入 backend 實例做註冊
+        except Exception as e:
+            # 你可視需要改成 logging.warning
+            print(f'[VivadoBackend] Warning: failed to register transformer templates: {e}')
 
     def _register_layer_attributes(self):
         # Add RNN-specific attributes, recurrent_reuse_factor and static implementation
@@ -55,6 +68,11 @@ class VivadoBackend(FPGABackend):
             LayerNorm,
             FeedForwardNetwork,
             #PositionEncoding,
+            # TopKPruning,
+            # EViTPruning,
+            # CLC_CachePush,
+            # CLC_RecoverAndEmpty3,
+            # CLC_RecoverAndEmpty1,
         ]
 
         for layer in rnn_layers:

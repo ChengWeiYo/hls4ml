@@ -117,7 +117,7 @@ def pytorch_to_hls(config):
     # This is a list of dictionaries to hold all the layer info we need to generate HLS
     layer_list = []
 
-    #print('Interpreting Model ...')
+    # print('Interpreting Model ...')
 
     reader = PyTorchFileReader(config) if isinstance(config['PytorchModel'], str) else PyTorchModelReader(config)
     if type(reader.input_shape) is tuple:
@@ -125,7 +125,7 @@ def pytorch_to_hls(config):
     else:
         input_shapes = list(reader.input_shape)
     input_shapes = [list(shape) for shape in input_shapes]
-
+    
     model = reader.torch_model
 
     # dict of layer objects in non-traced form for access lateron
@@ -245,8 +245,13 @@ def pytorch_to_hls(config):
                     mask = np.zeros((input_shapes[0][1], input_shapes[0][1]))
                     mask = mask.astype(int)
                     for transenc_layer in layer['layer_list'][0]['layer_list']:
+                        # print('    {}'.format(transenc_layer))
                         for transenc_sublayer in transenc_layer['layer_list']:
+                            # print('        {}'.format(transenc_sublayer))
                             if transenc_sublayer['class_name'] == 'MultiheadAttention':
+                                mask = np.zeros((transenc_sublayer['seq_len'], transenc_sublayer['seq_len']))
+                                mask = mask.astype(int)
+                                # print('        {}'.format(transenc_sublayer['seq_len']))
                                 transenc_sublayer['mask_data'] = mask
             #for multiheadattention
             if 'MultiheadAttention' in pytorch_class:

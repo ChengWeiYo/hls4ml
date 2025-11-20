@@ -31,6 +31,11 @@ from hls4ml.model.layers import (
     LayerNorm,
     MultiheadAttention,
     FeedForwardNetwork,
+    TopKPruning,
+    EViTPruning,
+    CLC_CachePush,
+    CLC_RecoverAndEmpty3,
+    CLC_RecoverAndEmpty1,
 )
 from hls4ml.model.optimizer import model_optimizer
 from hls4ml.model.types import (
@@ -69,6 +74,9 @@ class FPGABackend(Backend):
             LayerNorm,
             MultiheadAttention,
             FeedForwardNetwork,
+            TopKPruning,    
+            EViTPruning,        
+            CLC_CachePush,
         ]
 
         for layer in accum_layers:
@@ -141,7 +149,7 @@ class FPGABackend(Backend):
             )
         )
         ln_attrs.append(ConfigurableAttribute('var_table_size', default=1024))
-        ln_attrs.append(ConfigurableAttribute('var_table_range', default=8))
+        ln_attrs.append(ConfigurableAttribute('var_table_range', value_type=(int, float), default=8))
 
     def create_layer_class(self, layer_class):
         new_attrubutes = []

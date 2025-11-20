@@ -2,6 +2,43 @@ from hls4ml.converters.pytorch_to_hls import pytorch_handler
 from hls4ml.converters.utils import compute_padding_1d_pytorch, compute_padding_2d_pytorch, parse_data_format
 from hls4ml.converters.pytorch.core import parse_linear_layer
 from hls4ml.converters.pytorch_to_hls import layer_handlers
+import math
+
+def _normalize_reduction_cfg(cfg: dict):
+    # print(f"[DEBUG] _normalize_reduction_cfg 接收到的 cfg: {cfg}")
+    # print(f"[DEBUG] cfg 的類型: {type(cfg)}")
+    
+    cfg = cfg or {}
+    loc = cfg.get('reduction_loc', [])
+    kr  = cfg.get('keep_rate', [])
+    use_clc = bool(cfg.get('use_clc', False))
+    method = cfg.get('method', 'topk')
+
+    valid_methods = ['topk', 'evit']
+    if method not in valid_methods:
+        raise ValueError(f"Unsupported token reduction method: {method}. Use {valid_methods}")
+    
+    # print(f"[DEBUG] reduction_loc: {loc}")
+    # print(f"[DEBUG] keep_rate: {kr}")
+    # print(f"[DEBUG] use_clc: {use_clc}")
+    
+    # broadcast keep_rate if single value
+    if isinstance(kr, (int, float)):
+        kr = [float(kr)]
+    if len(kr) == 1 and len(loc) > 1:
+        kr = kr * len(loc)
+    
+    kr_map = {int(l): float(k) for l, k in zip(loc, kr)} if loc and kr else {}
+    # print(f"[DEBUG] 最終的 kr_map: {kr_map}")
+    # print(f"[DEBUG] 最終的 use_clc: {use_clc}")
+    
+    return kr_map, use_clc, method
+
+def _encoder_layer_index(layer_name: str):
+    try:
+        return int(layer_name.split('_')[-1])
+    except Exception:
+        return None
 
 @pytorch_handler('LayerNorm')
 def parse_layernorm_layer(operation, layer_name, input_names, input_shapes, node, class_object, data_reader, config):
@@ -66,6 +103,7 @@ def parse_ffn_layer(operation, layer_name, input_names, input_shapes, node, clas
 
 @pytorch_handler('TransformerEncoderLayer')
 def parse_transenc_layer(operation, layer_name, input_names, input_shapes, node, class_object, data_reader, config):
+
     assert 'TransformerEncoderLayer' in operation
     layer = {}
 
@@ -88,18 +126,120 @@ def parse_transenc_layer(operation, layer_name, input_names, input_shapes, node,
         sublayer, _= layer_handlers['add']('add', layer_name+'_add1', [layer_name+'_self_attn', prev_layer_name[0]], input_shapes, node, subclass_object, data_reader, config)
         layer_list.append(sublayer)
 
+        # print(f"[DEBUG] {layer_name} input_shapes: {input_shapes}")
+        # print(f"[DEBUG] {layer_name} input_shapes[0]: {input_shapes[0]}")
+
+        kr_map, use_clc, method = _normalize_reduction_cfg(config.get('HLSConfig', {}).get('Model', {}).get('Reduction', {}))
+        enc_idx = _encoder_layer_index(layer_name)
+        # print(f"[DEBUG] layer_name: {layer_name}, enc_idx: {enc_idx}")
+        # print(f"[DEBUG] kr_map: {kr_map}, use_clc: {use_clc}")
+        keep_len = None
+        next_input_name = layer_name + '_add1'  # default, if not pruned here
+        
+        if enc_idx is not None and enc_idx in kr_map:
+            keep_rate = kr_map[enc_idx]
+            prune_name = layer_name + '_prune'  # consistent suffix for later passes
+
+            if method == 'topk':
+                prune_layer = {
+                    'name': prune_name,
+                    'inputs': [layer_name + '_add1'],
+                    'class_name': 'TopKPruning',
+                    'data_format': 'channels_first',
+                    'keep_rate': keep_rate,
+                    'use_clc': use_clc,
+                    'embed_dim': input_shapes[0][-1],
+                    'seq_len_in': input_shapes[0][-2],
+                    'seq_len_out': math.ceil((input_shapes[0][-2] - 1) * keep_rate) + 1,
+                }
+            elif method == 'evit':
+                prune_layer = {
+                    'name': prune_name,
+                    'inputs': [layer_name + '_add1'],
+                    'class_name': 'EViTPruning',
+                    'data_format': 'channels_first',
+                    'keep_rate': keep_rate,
+                    'use_clc': use_clc,
+                    'embed_dim': input_shapes[0][-1],
+                    'seq_len_in': input_shapes[0][-2],
+                    'seq_len_out': math.ceil((input_shapes[0][-2] - 1) * keep_rate) + 2,
+                }
+            layer_list.append(prune_layer)
+            keep_len = prune_layer['seq_len_out']
+            input_shapes[0] = (input_shapes[0][0], keep_len, input_shapes[0][2])
+            next_input_name = prune_name
+
         subclass_object = class_object.__dict__['_modules']['norm2']
-        sublayer, _= layer_handlers['LayerNorm']('LayerNorm', layer_name+'_norm2', [layer_name+'_add1'], input_shapes, node, subclass_object, data_reader, config)
+        sublayer, _= layer_handlers['LayerNorm']('LayerNorm', layer_name+'_norm2', [next_input_name], input_shapes, node, subclass_object, data_reader, config)
+        if keep_len is not None:
+            sublayer['seq_len'] = int(keep_len)
         layer_list.append(sublayer)
 
         subclass_object1 = class_object.__dict__['_modules']['linear1']
         subclass_object2 = class_object.__dict__['_modules']['linear2']
         sublayer, _= layer_handlers['FeedForwardNetwork']('FeedForwardNetwork', layer_name+'_ffn', [layer_name+'_norm2'], input_shapes, node, subclass_object1, subclass_object2, data_reader, config)
         sublayer["activation"] = class_object.activation
+        if keep_len is not None:
+            sublayer['seq_len'] = int(keep_len)
         layer_list.append(sublayer)
 
-        sublayer, _= layer_handlers['add']('add', layer_name+'_add2', [layer_name+'_ffn', layer_name+'_add1'], input_shapes, node, subclass_object, data_reader, config)
+        sublayer, _= layer_handlers['add']('add', layer_name+'_add2', [layer_name+'_ffn', next_input_name], input_shapes, node, subclass_object, data_reader, config)
         layer_list.append(sublayer)
+
+        next_input_name = layer_name + '_add2'
+
+        if use_clc:
+            if enc_idx in kr_map:
+                # layer 3,6,9 都是CLC_RecoverAndEmpty3 (恢復6個tokens)
+                reduction_locations = sorted(kr_map.keys())
+                group_idx = reduction_locations.index(enc_idx)
+                group_id = f'g{group_idx}'
+                
+                recover_layer = {
+                    'name': f'{layer_name}_clc_recover',
+                    'class_name': 'CLC_RecoverAndEmpty3',
+                    'inputs': [next_input_name],
+                    'embed_dim': input_shapes[0][-1],
+                    'N_pruned': input_shapes[0][-2],
+                    'group_id': group_id,
+                    'seq_len_out': input_shapes[0][-2] + 6,
+                }
+                layer_list.append(recover_layer)
+                keep_len = recover_layer['seq_len_out']
+                input_shapes[0] = (input_shapes[0][0], keep_len, input_shapes[0][2])
+                # input_shapes[0][-2] += 6  # 恢復6個tokens
+                next_input_name = f'{layer_name}_clc_recover'
+            
+            elif enc_idx == 10:
+                # layer 10: CLC_RecoverAndEmpty1 (恢復2個tokens)
+                recover_layer = {
+                    'name': f'{layer_name}_clc_recover',
+                    'class_name': 'CLC_RecoverAndEmpty1',
+                    'inputs': [next_input_name],
+                    'embed_dim': input_shapes[0][-1],
+                    'N_pruned': input_shapes[0][-2],  # 應該是14
+                    'group_id': 'g3',
+                    'seq_len_out': input_shapes[0][-2] + 2,
+                }
+                layer_list.append(recover_layer)
+                keep_len = recover_layer['seq_len_out']
+                input_shapes[0] = (input_shapes[0][0], keep_len, input_shapes[0][2])
+                # input_shapes[0][-2] += 2  # 恢復2個tokens
+                next_input_name = f'{layer_name}_clc_recover'
+        
+        if use_clc and enc_idx < 10:
+            group_id = f'g{enc_idx // 3}'
+            
+            cache_push_layer = {
+                'name': f'{layer_name}_clc_push',
+                'class_name': 'CLC_CachePush',
+                'inputs': [next_input_name],
+                'seq_len': input_shapes[0][-2],
+                'embed_dim': input_shapes[0][-1],
+                'group_id': group_id,
+            }
+            layer_list.append(cache_push_layer)
+            # next_input_name = f'{layer_name}_clc_push'
     else:
         subclass_object = class_object.__dict__['_modules']['self_attn']
         sublayer, _= layer_handlers['MultiheadAttention']('MultiheadAttention', layer_name+'_self_attn', prev_layer_name, input_shapes, node, subclass_object, data_reader, config)
@@ -108,22 +248,116 @@ def parse_transenc_layer(operation, layer_name, input_names, input_shapes, node,
         sublayer, _= layer_handlers['add']('add', layer_name+'_add1', [layer_name+'_self_attn', prev_layer_name[0]], input_shapes, node, subclass_object, data_reader, config)
         layer_list.append(sublayer)
 
+        kr_map, use_clc, method = _normalize_reduction_cfg(config.get('Model', {}).get('Reduction', {}))
+        enc_idx = _encoder_layer_index(layer_name)
+        keep_len = None
+        next_input_name = layer_name + '_add1'  # default, if not pruned here
+        if enc_idx is not None and enc_idx in kr_map:
+            keep_rate = kr_map[enc_idx]
+            prune_name = layer_name + '_prune'  # consistent suffix for later passes
+
+            if method == 'topk':
+                prune_layer = {
+                    'name': prune_name,
+                    'inputs': [layer_name + '_add1'],
+                    'class_name': 'TopKPruning',
+                    'data_format': 'channels_first',
+                    'keep_rate': keep_rate,
+                    'use_clc': use_clc,
+                    'embed_dim': input_shapes[0][-1],
+                    'seq_len_in': input_shapes[0][-2],
+                    'seq_len_out': math.ceil((input_shapes[0][-2] - 1) * keep_rate) + 1,
+                }
+            elif method == 'evit':
+                prune_layer = {
+                    'name': prune_name,
+                    'inputs': [layer_name + '_add1'],
+                    'class_name': 'EViTPruning',
+                    'data_format': 'channels_first',
+                    'keep_rate': keep_rate,
+                    'use_clc': use_clc,
+                    'embed_dim': input_shapes[0][-1],
+                    'seq_len_in': input_shapes[0][-2],
+                    'seq_len_out': math.ceil((input_shapes[0][-2] - 1) * keep_rate) + 2,
+                }
+            layer_list.append(prune_layer)
+            keep_len = prune_layer['seq_len_out']
+            next_input_name = prune_name
+
         subclass_object = class_object.__dict__['_modules']['norm1']
-        sublayer, _= layer_handlers['LayerNorm']('LayerNorm', layer_name+'_norm1', [layer_name+'_add1'], input_shapes, node, subclass_object, data_reader, config)
+        sublayer, _= layer_handlers['LayerNorm']('LayerNorm', layer_name+'_norm1', [next_input_name], input_shapes, node, subclass_object, data_reader, config)
+        if keep_len is not None:
+            sublayer['seq_len'] = int(keep_len)
         layer_list.append(sublayer)
 
         subclass_object1 = class_object.__dict__['_modules']['linear1']
         subclass_object2 = class_object.__dict__['_modules']['linear2']
         sublayer, _= layer_handlers['FeedForwardNetwork']('FeedForwardNetwork', layer_name+'_ffn', [layer_name+'_norm2'], input_shapes, node, subclass_object1, subclass_object2, data_reader, config)
         sublayer["activation"] = class_object.activation
+        if keep_len is not None:
+            sublayer['seq_len'] = int(keep_len)
         layer_list.append(sublayer)
 
-        sublayer, _= layer_handlers['add']('add', layer_name+'_add2', [layer_name+'_linear2', layer_name+'_norm1'], input_shapes, node, subclass_object, data_reader, config)
+        sublayer, _= layer_handlers['add']('add', layer_name+'_add2', [layer_name+'_ffn', next_input_name], input_shapes, node, subclass_object, data_reader, config)
+        if keep_len is not None:
+            sublayer['seq_len'] = int(keep_len)
         layer_list.append(sublayer)
 
         subclass_object = class_object.__dict__['_modules']['norm2']
         sublayer, _= layer_handlers['LayerNorm']('LayerNorm', layer_name+'_norm2', [layer_name+'_add2'], input_shapes, node, subclass_object, data_reader, config)
         layer_list.append(sublayer)
+
+        next_input_name = layer_name + '_norm2'
+
+        if use_clc:
+            # 判斷是否需要CLC_RecoverAndEmpty3 (有pruning的layers)
+            if enc_idx in kr_map:
+                # layer 3,6,9 都是CLC_RecoverAndEmpty3 (恢復6個tokens)
+                reduction_locations = sorted(kr_map.keys())
+                group_idx = reduction_locations.index(enc_idx)
+                group_id = f'g{group_idx}'
+                
+                recover_layer = {
+                    'name': f'{layer_name}_clc_recover',
+                    'class_name': 'CLC_RecoverAndEmpty3',
+                    'inputs': [next_input_name],
+                    'embed_dim': input_shapes[0][-1],
+                    'N_pruned': input_shapes[0][-2],
+                    'group_id': group_id,
+                }
+                layer_list.append(recover_layer)
+                input_shapes[0][-2] += 6  # 恢復6個tokens
+                next_input_name = f'{layer_name}_clc_recover'
+            
+            # 判斷是否需要CLC_RecoverAndEmpty1 (layer 10的特殊情況)
+            elif enc_idx == 10:
+                # layer 10: CLC_RecoverAndEmpty1 (恢復2個tokens)
+                recover_layer = {
+                    'name': f'{layer_name}_clc_recover',
+                    'class_name': 'CLC_RecoverAndEmpty1',
+                    'inputs': [next_input_name],
+                    'embed_dim': input_shapes[0][-1],
+                    'N_pruned': input_shapes[0][-2],  # 應該是14
+                    'group_id': 'g3',
+                }
+                layer_list.append(recover_layer)
+                input_shapes[0][-2] += 2  # 恢復2個tokens
+                next_input_name = f'{layer_name}_clc_recover'
+        
+        # 9. 新增：CLC_CachePush (每個layer最後都有)
+        if use_clc:
+            group_id = f'g{enc_idx // 3}'
+            
+            cache_push_layer = {
+                'name': f'{layer_name}_clc_push',
+                'class_name': 'CLC_CachePush',
+                'inputs': [next_input_name],
+                'seq_len': input_shapes[0][-2],
+                'embed_dim': input_shapes[0][-1],
+                'group_id': group_id,
+            }
+            layer_list.append(cache_push_layer)
+            # next_input_name = f'{layer_name}_clc_push'
         
     layer['output_shape'] = input_shapes
     layer['layer_list'] = layer_list

@@ -1385,6 +1385,83 @@ class MultiheadAttention(Layer):
         self.set_attr('row_sum_t', NamedType(*reversed(self.model.config.get_precision(self, 'row_sum_t'))))
         self.set_attr('out_proj_in_t', NamedType(*reversed(self.model.config.get_precision(self, 'out_proj_in_t'))))
 
+class TopKPruning(Layer):
+    _expected_attributes = [
+        Attribute('keep_rate', value_type=float),
+        Attribute('seq_len_in'),
+        Attribute('seq_len_out'),
+        Attribute('embed_dim'),
+    ]
+
+    def initialize(self):
+        seq_out = int(self.attributes['seq_len_out'])
+        emb     = int(self.attributes['embed_dim'])
+        shape   = [seq_out, emb]
+        dims    = [f'prune_seq_out_{self.index}', f'prune_feature_out_{self.index}']
+        self.add_output_variable(shape, dims)
+
+class EViTPruning(Layer):
+    _expected_attributes = [
+        Attribute('keep_rate', value_type=float),
+        Attribute('seq_len_in'),
+        Attribute('seq_len_out'),
+        Attribute('embed_dim'),
+    ]
+
+    def initialize(self):
+        # 輸入/輸出型別沿用預設的 'result' 精度（與前一層一致）
+        seq_out = int(self.attributes['seq_len_out'])
+        emb     = int(self.attributes['embed_dim'])
+        shape   = [seq_out, emb]
+        dims    = [f'prune_seq_out_{self.index}', f'prune_feature_out_{self.index}']
+        self.add_output_variable(shape, dims)
+
+class CLC_CachePush(Layer):
+    """CLC Cache Push layer"""
+    _expected_attributes = [
+        Attribute('embed_dim'),
+        Attribute('seq_len'),
+        Attribute('group_id', value_type=str),
+    ]
+
+    def initialize(self):
+        seq_len = int(self.attributes['seq_len'])
+        emb_dim = int(self.attributes['embed_dim'])
+        
+        shape = [seq_len, emb_dim]
+        dims = [f'clc_push_seq_{self.index}', f'clc_push_emb_{self.index}']
+        self.add_output_variable(shape, dims)
+
+class CLC_RecoverAndEmpty3(Layer):
+    """CLC Recover and Empty layer - 恢復6個tokens"""
+    _expected_attributes = [
+        Attribute('embed_dim'),
+        Attribute('N_pruned'),      # 剪枝後token數
+        Attribute('group_id', value_type=str),      # g0, g1, g2
+    ]
+
+    def initialize(self):
+        seq_out = int(self.attributes['seq_len_out'])
+        emb     = int(self.attributes['embed_dim'])
+        shape   = [seq_out, emb]
+        dims = [f'clc_recover3_seq_{self.index}', f'clc_recover3_emb_{self.index}']
+        self.add_output_variable(shape, dims)
+
+class CLC_RecoverAndEmpty1(Layer):
+    """CLC Recover and Empty layer - 恢復2個tokens"""
+    _expected_attributes = [
+        Attribute('embed_dim'),
+        Attribute('N_pruned'),      # 剪枝後token數
+        Attribute('group_id', value_type=str),      # g3
+    ]
+
+    def initialize(self):
+        seq_out = int(self.attributes['seq_len_out'])
+        emb     = int(self.attributes['embed_dim'])
+        shape   = [seq_out, emb]
+        dims = [f'clc_recover1_seq_{self.index}', f'clc_recover1_emb_{self.index}']
+        self.add_output_variable(shape, dims)
+
 class LayerGroup(Layer):
     _expected_attributes = [
         Attribute('layer_list', value_type=list),
@@ -1484,6 +1561,11 @@ layer_map = {
     'MultiheadAttention': MultiheadAttention,
     'LayerNorm': LayerNorm,
     'FeedForwardNetwork': FeedForwardNetwork,
+    'TopKPruning': TopKPruning,
+    'EViTPruning': EViTPruning,
+    'CLC_CachePush': CLC_CachePush,
+    'CLC_RecoverAndEmpty3': CLC_RecoverAndEmpty3,
+    'CLC_RecoverAndEmpty1': CLC_RecoverAndEmpty1,
 }
 
 

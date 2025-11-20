@@ -350,7 +350,7 @@ def config_from_pytorch_model(
     output_shape = None
 
     # Loop through layers
-    #print('TTTTTTTTTopology:')
+    #print('Topology:')
     layer_counter = 0
 
     n_inputs = 0
